@@ -2,13 +2,15 @@ from sentence_transformers import SentenceTransformer
 import chromadb
 from config import (CHROMA_DB_PATH, COLLECTION_NAME, EMBEDDING_MODEL,
                     EMBEDDING_DEVICE, STOP_WORDS, SCORE_THRESHOLD,
-                    MAX_CHUNKS_PER_CHAPTER, N_RESULTS)
+                    MAX_CHUNKS_PER_CHAPTER, N_RESULTS, SUMMARY_COLLECTION_NAME, TOP_CHAPTERS)
 import re
+from rank_bm25 import BM25Okapi
 
 # Load model and database once
 model = SentenceTransformer(EMBEDDING_MODEL, device=EMBEDDING_DEVICE)
 client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-collection = client.get_collection(COLLECTION_NAME)
+chunk_collection = client.get_collection(COLLECTION_NAME)
+summary_collection = client.get_collection(SUMMARY_COLLECTION_NAME)
 
 # Filler phrases to strip from queries before retrieval
 FILLER_PHRASES = [
@@ -17,6 +19,21 @@ FILLER_PHRASES = [
     "please explain", "what is", "what are", "what was",
     "describe", "discuss", "elaborate on",
 ]
+
+def get_top_chapters(query_vector):
+    """Get top relevant chapters based on query vector first from the summary collection."""
+    results = summary_collection.query(
+        query_embeddings=[query_vector],
+        n_results=TOP_CHAPTERS,
+        include=["metadatas", "distances"]
+    )
+    #Creating top chapter number list
+    top_chapters = []
+
+    for meta in results["metadatas"][0]:
+        top_chapters.append(meta["chapter_num"])
+
+    return set(top_chapters)
 
 
 def normalize_query(query):
@@ -33,23 +50,36 @@ def extract_keywords(query):
     tokens = re.findall(r"\b\w+\b", query.lower())
     return [t for t in tokens if len(t) > 3 and t not in STOP_WORDS]
 
+def get_phrase_bonus(query, doc):
+    """Give extra bonus if the exact query phrase appears in the document"""
+    q=query.lower().strip()
+    d = doc.lower()
+
+    if q in d:
+        return 0.2
+
+    return 0.0
 
 def retrieve(query):
-    """Full retrieval pipeline: normalize → vector search → keyword rerank → filter."""
+    """Hierarchical retrieval: summary retrieval -> chapter-constrained chunk retrieval -> rerank -> filter."""
 
     # 1. Normalize query for retrieval
     retrieval_query = normalize_query(query)
     query_vector = model.encode(retrieval_query).tolist()
     keywords = extract_keywords(retrieval_query)
 
-    # 2. Always start with vector search (wide net)
-    results = collection.query(
+    # 2. First stage retrieval: getting the most relevant chapters
+    top_chapters = get_top_chapters(query_vector)
+
+    # 3. Secondary retrieval: search chunk candidates from the chunk collection
+    results = chunk_collection.query(
         query_embeddings=[query_vector],
         n_results=20,
+        where={"chapter_num": {"$in": list(top_chapters)}},
         include=["documents", "metadatas", "distances"]
     )
 
-    # 3. Rerank: semantic score + keyword bonus
+
     candidates = []
     for doc, meta, dist in zip(results["documents"][0],
                                results["metadatas"][0],
@@ -58,8 +88,8 @@ def retrieve(query):
         doc_tokens = set(re.findall(r"\b\w+\b", doc.lower()))
         matches = sum(1 for kw in keywords if kw in doc_tokens)
         coverage = matches / len(keywords) if keywords else 0
-        keyword_bonus = 0.15 * coverage
-        final_score = round(semantic_score + keyword_bonus, 3)
+        phrase_bonus = get_phrase_bonus(retrieval_query, doc)
+        final_score = round(0.7 * semantic_score + 0.2 * coverage + phrase_bonus, 3)
         candidates.append((doc, meta, final_score))
 
     # Sort by final score descending
@@ -95,7 +125,6 @@ def retrieve(query):
     # 6. Fallback: if nothing passed, retry with pure vector and lower threshold
     if not filtered_docs:
         for doc, meta, score in candidates[:5]:
-            if score >= 0.08:
                 filtered_docs.append(doc)
                 filtered_metas.append((meta, score))
 

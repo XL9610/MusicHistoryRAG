@@ -3,7 +3,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 import chromadb
 import shutil
-from config import (PDF_PATH, CHROMA_DB_PATH, COLLECTION_NAME,
+from config import (PDF_PATH, CHROMA_DB_PATH, COLLECTION_NAME,SUMMARY_COLLECTION_NAME,
                     EMBEDDING_MODEL, EMBEDDING_DEVICE)
 
 # ============================================================
@@ -52,6 +52,15 @@ CHAPTER_TITLES = [
 ]
 
 SOURCE_LABEL = "Burkholder - A History of Western Music, 10th ed."
+
+def make_chapter_summary(chapter_text: str, max_chars: int = 1200) -> str:
+    """
+    This is a pseudo-summary implemented for building the hierarchical retrieval pipeline
+    Taking just the first max_chars characters from each chapter text
+    """
+    clean = " ".join(chapter_text.split())
+    return clean[:max_chars]
+
 
 # ============================================================
 # Step 1: Extract text from PDF
@@ -104,7 +113,7 @@ for line in cleaned_lines:
     else:
         current_lines.append(line)
 
-# Don't forget the last chapter
+# The last chapter
 if current_lines:
     chapters.append(current_lines)
 
@@ -123,8 +132,24 @@ splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
 all_chunks = []
 all_metadata = []
 
+chapter_summaries = []
+all_summary_metadata = []
+
+
 for i, chapter in enumerate(chapters):
     chapter_text = "".join(chapter)
+
+    #Chapter level summary text
+    summary_text = make_chapter_summary(chapter_text)
+    chapter_summaries.append(summary_text)
+    all_summary_metadata.append({
+        "chapter_title": CHAPTER_TITLES[i],
+        "chapter_num": i + 1,
+        "source": SOURCE_LABEL
+    })
+
+
+    #Chunks level texts
     chunks = splitter.split_text(chapter_text)
 
     for j, chunk in enumerate(chunks):
@@ -137,6 +162,7 @@ for i, chapter in enumerate(chapters):
         })
 
 print(f"  Total chunks: {len(all_chunks)}")
+print(f"  Total chapter summaries: {len(chapter_summaries)}")
 
 # ============================================================
 # Step 5: Generate embeddings
@@ -144,9 +170,13 @@ print(f"  Total chunks: {len(all_chunks)}")
 print("Generating embeddings (this may take ~30 seconds)...")
 
 model = SentenceTransformer(EMBEDDING_MODEL, device=EMBEDDING_DEVICE)
+
 vectors = model.encode(all_chunks, show_progress_bar=True)
+summary_vectors = model.encode(chapter_summaries, show_progress_bar=True)
 
 print(f"  Embedding shape: {vectors.shape}")
+print(f"  Summary embedding shape: {summary_vectors.shape}")
+
 
 # ============================================================
 # Step 6: Store in ChromaDB
@@ -155,15 +185,33 @@ print("Storing in ChromaDB...")
 
 shutil.rmtree(CHROMA_DB_PATH, ignore_errors=True)
 client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-collection = client.get_or_create_collection(COLLECTION_NAME)
+
+summary_collection = client.get_or_create_collection(
+    name=SUMMARY_COLLECTION_NAME,
+    metadata={"hnsw:space" : "cosine"}
+)
+
+chunk_collection = client.get_or_create_collection(
+    name=COLLECTION_NAME,
+    metadata={"hnsw:space": "cosine"}
+)
 
 for i in range(len(all_chunks)):
-    collection.add(
+    chunk_collection.add(
         ids=[f"chunk_{i}"],
         documents=[all_chunks[i]],
         embeddings=[vectors[i].tolist()],
         metadatas=[all_metadata[i]]
     )
 
-print(f"  Stored {collection.count()} chunks")
+for i in range(len(chapter_summaries)):
+    summary_collection.add(
+        ids = [f"chunk_{i}"],
+        documents = [chapter_summaries[i]],
+        embeddings = [summary_vectors[i].tolist()],
+        metadatas=[all_summary_metadata[i]]
+    )
+
+print(f"  Stored {chunk_collection.count()} chunks")
+print(f"  Stored {summary_collection.count()} summaries")
 print("\nDatabase built successfully!")
