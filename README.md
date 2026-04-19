@@ -24,23 +24,27 @@ It was first established in the 18th century... (Chapter 23)
 User Question
       │
       ▼
-┌──────────────────┐
-│ Query Normalization │  Strip filler phrases ("expand on", "explain")
-└──────┬───────────┘
+┌──────────────────────┐
+│  Query Normalization │  Strip filler phrases ("expand on", "explain")
+└──────┬───────────────┘
        ▼
 ┌──────────────┐
-│  Embedding   │  all-MiniLM-L6-v2 (384-dim, local CPU)
+│   Embedding  │  all-MiniLM-L6-v2 (384-dim, local CPU)
 └──────┬───────┘
        ▼
-┌──────────────┐
-│  ChromaDB    │  2,240 chunks with chapter metadata
-└──────┬───────┘
+┌───────────────────────┐
+│  Summary Collection   │  39 chapter summaries → identify top 3 chapters
+└──────┬────────────────┘
        ▼
-┌──────────────────┐
-│ Keyword Reranking │  Boost chunks containing query terms
-│ Dynamic Threshold │  Adapt cutoff per query
-│ Chapter Diversity │  Max 2 chunks per chapter
-└──────┬───────────┘
+┌───────────────────────┐
+│  Chunk Collection     │  Search chunks within top chapters only
+└──────┬────────────────┘
+       ▼
+┌──────────────────────┐
+│  Reranking & Filter  │  Keyword coverage + phrase bonus
+│  Dynamic Threshold   │  Adapt cutoff per query
+│  Chapter Diversity   │  Max 3 chunks per chapter
+└──────┬───────────────┘
        ▼
 ┌──────────────┐
 │   LLM API    │  Generate answer with source citations
@@ -60,8 +64,8 @@ User Question
 ### Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/music-rag.git
-cd music-rag
+git clone https://github.com/XL9610/MusicHistoryRAG.git
+cd MusicHistoryRAG
 pip install -r requirements.txt
 ```
 
@@ -87,8 +91,8 @@ This takes about 1–2 minutes and will:
 1. Extract text from the PDF (skipping front matter and appendices)
 2. Clean noise (score artifacts, map labels, figure captions)
 3. Split into 39 chapters, then chunk each chapter (~1,500 chars with 200-char overlap)
-4. Generate embeddings using a local transformer model
-5. Store 2,240 chunks with metadata in a local ChromaDB database
+4. Generate chapter summaries (first 1,200 chars per chapter) and chunk embeddings
+5. Store 2,240 chunks + 39 chapter summaries in a local ChromaDB database (cosine distance)
 
 ### Query
 
@@ -100,30 +104,34 @@ python query.py
 
 ```
 ├── config.py           # All tunable parameters
-├── retriever.py        # Search pipeline: normalize → retrieve → rerank → filter
+├── retriever.py        # Hierarchical retrieval: summary → chunk → rerank → filter
 ├── generator.py        # LLM prompt and API call
-├── query.py            # Interactive CLI (~20 lines)
-├── build_database.py   # Full ingestion pipeline: PDF → ChromaDB
+├── query.py            # Interactive CLI
+├── build_database.py   # Full ingestion pipeline: PDF → ChromaDB (chunks + summaries)
 ├── requirements.txt
 └── .env                # API key (not committed)
 ```
 
 ## Retrieval Strategy
 
-The retrieval pipeline went through three iterations:
+The retrieval pipeline went through four iterations:
 
 **v1 — Keyword gate**: Used keyword filtering (`$contains`) as an entry point before vector search. Failed on natural language queries like "expand on galant style" because irrelevant keywords ("expand") narrowed the search space.
 
 **v2 — Improved keyword gate**: Added stop words, case-variant matching, term sorting by length. Better, but the fundamental architecture was still fragile.
 
-**v3 — Vector-first with keyword reranking (current)**: Always starts with broad vector search (top 20), then applies keyword-based reranking, dynamic thresholds, and chapter diversity filtering. Most stable across diverse query types.
+**v3 — Vector-first with keyword reranking**: Always starts with broad vector search (top 20), then applies keyword-based reranking, dynamic thresholds, and chapter diversity filtering. Most stable across diverse query types.
+
+**v4 — Hierarchical retrieval (current)**: Adds a chapter summary layer. First retrieves the top 3 most relevant chapters via summary embeddings, then searches chunks only within those chapters. Reranking uses a weighted formula: `0.7 × semantic_score + 0.2 × keyword_coverage + phrase_bonus`.
 
 Key features:
+- **Hierarchical search** — chapter-level summary retrieval narrows scope before chunk search
 - **Query normalization** — strips filler phrases before embedding
 - **Keyword reranking** — boosts chunks containing query terms without excluding those that don't
+- **Phrase bonus** — extra score if the exact query phrase appears in a chunk
 - **Dynamic threshold** — `max(0.08, top_score × 0.5)` adapts to each query's score distribution
-- **Chapter diversity** — max 2 chunks per chapter to avoid redundant results
-- **Fallback** — retries with relaxed threshold if primary filtering returns empty
+- **Chapter diversity** — max 3 chunks per chapter to avoid redundant results
+- **Fallback** — returns top 5 candidates if primary filtering returns empty
 
 ## Tech Stack
 
@@ -132,7 +140,7 @@ Key features:
 | PDF extraction | PyMuPDF |
 | Text chunking | LangChain RecursiveCharacterTextSplitter |
 | Embeddings | sentence-transformers/all-MiniLM-L6-v2 |
-| Vector database | ChromaDB |
+| Vector database | ChromaDB (cosine distance) |
 | LLM | MiniMax-M2.7 (via Anthropic SDK) |
 
 ## Limitations
@@ -140,10 +148,12 @@ Key features:
 - Chunking is fixed-size, not section-aware — some chunks split mid-paragraph
 - Single-turn only — no conversation memory
 - Reranking is lexical keyword overlap, not a cross-encoder model
+- Summary layer uses first 1,200 chars as a pseudo-summary, not LLM-generated
 - No formal evaluation framework yet
 
 ## Planned Features
 
+- **Hybrid Search** — add BM25 keyword retrieval alongside embedding search, two parallel retrieval paths with merged results, replacing the current summary-layer architecture for more robust recall on both identifier queries (BWV numbers, opus numbers) and natural language queries
 - **Quiz Mode** — auto-generate multiple-choice questions from textbook content
 - **Composer Profile** — input a name, get a structured summary from all mentions
 - **Concept Tracker** — trace a concept's evolution across chapters and eras
