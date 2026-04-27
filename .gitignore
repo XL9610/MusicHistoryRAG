@@ -7,3 +7,6 @@ Experiments/
 *.pdf
 output.txt
 cleaned.txt
+chapter_summaries.json
+test.py
+check_summaries.py

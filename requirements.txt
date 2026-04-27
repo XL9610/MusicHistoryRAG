@@ -4,3 +4,5 @@ chromadb
 langchain-text-splitters
 anthropic
 python-dotenv
+rank-bm25
+openai

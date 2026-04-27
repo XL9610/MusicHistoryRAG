@@ -1,155 +1,183 @@
 import fitz
+import os
+import json
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 import chromadb
 import shutil
-from config import (PDF_PATH, CHROMA_DB_PATH, COLLECTION_NAME,SUMMARY_COLLECTION_NAME,
-                    EMBEDDING_MODEL, EMBEDDING_DEVICE)
+import anthropic
+from config import (PDF_PATH, CHROMA_DB_PATH, COLLECTION_NAME, SUMMARY_COLLECTION_NAME,
+                    EMBEDDING_MODEL, EMBEDDING_DEVICE, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL,
+                    SUMMARY_API_KEY, SUMMARY_MODEL)
+llm = anthropic.Anthropic(
+    api_key=LLM_API_KEY,
+    base_url=LLM_BASE_URL
+)
 
-# ============================================================
-# Chapter titles (in order, corresponding to chapters 1-39)
-# ============================================================
-CHAPTER_TITLES = [
-    "Chapter 1: Music in Antiquity",
-    "Chapter 2: The Christian Church in the First Millennium",
-    "Chapter 3: Roman Liturgy and Chant",
-    "Chapter 4: Song and Dance Music to 1300",
-    "Chapter 5: Polyphony through the Thirteenth Century",
-    "Chapter 6: New Developments in the Fourteenth Century",
-    "Chapter 7: Music and the Renaissance",
-    "Chapter 8: England and Burgundy in the Fifteenth Century",
-    "Chapter 9: Franco-Flemish Composers, 1450-1520",
-    "Chapter 10: Madrigal and Secular Song in the Sixteenth Century",
-    "Chapter 11: Sacred Music in the Era of the Reformation",
-    "Chapter 12: The Rise of Instrumental Music",
-    "Chapter 13: New Styles in the Seventeenth Century",
-    "Chapter 14: The Invention of Opera",
-    "Chapter 15: Music for Chamber and Church in the Early Seventeenth Century",
-    "Chapter 16: France, England, Spain, the New World, and Russia in the Seventeenth Century",
-    "Chapter 17: Italy and Germany in the Late Seventeenth Century",
-    "Chapter 18: The Early Eighteenth Century in Italy and France",
-    "Chapter 19: German Composers of the Late Baroque",
-    "Chapter 20: Musical Taste and Style in the Enlightenment",
-    "Chapter 21: Opera and Vocal Music in the Early Classic Period",
-    "Chapter 22: Instrumental Music: Sonata, Symphony, and Concerto",
-    "Chapter 23: Classic Music in the Late Eighteenth Century",
-    "Chapter 24: Revolution and Change",
-    "Chapter 25: The Romantic Generation: Song and Piano Music",
-    "Chapter 26: Romanticism in Classical Forms: Choral, Chamber, and Orchestral Music",
-    "Chapter 27: Romantic Opera and Musical Theater to Midcentury",
-    "Chapter 28: Opera and Musical Theater in the Later Nineteenth Century",
-    "Chapter 29: Late Romanticism in German Musical Culture",
-    "Chapter 30: Diverging Traditions in the Later Nineteenth Century",
-    "Chapter 31: The Early Twentieth Century: Vernacular Music",
-    "Chapter 32: The Early Twentieth Century: The Classical Tradition",
-    "Chapter 33: Radical Modernists",
-    "Chapter 34: Between the World Wars: Jazz and Popular Music",
-    "Chapter 35: Between the World Wars: The Classical Tradition",
-    "Chapter 36: Postwar Crosscurrents",
-    "Chapter 37: Postwar Heirs to the Classical Tradition",
-    "Chapter 38: The Late Twentieth Century",
-    "Chapter 39: The Twenty-First Century",
-]
+#OPENAI LLM for summary
+summary_llm = OpenAI(api_key=SUMMARY_API_KEY)
+
 
 SOURCE_LABEL = "Burkholder - A History of Western Music, 10th ed."
 
-def make_chapter_summary(chapter_text: str, max_chars: int = 1200) -> str:
+SUMMARY_CASHE = "chapter_summaries.json"
+
+def make_chapter_summary(chapter_text: str, chapter_title: str) -> str:
     """
-    This is a pseudo-summary implemented for building the hierarchical retrieval pipeline
-    Taking just the first max_chars characters from each chapter text
+    Use LLM to generate a retrieval-optimized chapter summary.
     """
-    clean = " ".join(chapter_text.split())
-    return clean[:max_chars]
+    # Truncate to avoid exceeding context window
+    truncated = chapter_text[:8000]
+
+    response =summary_llm.chat.completions.create(
+        model=SUMMARY_MODEL,
+        max_tokens=600,
+        messages=[{
+            "role": "user",
+            "content": f"""Summarize this music history chapter for a retrieval system.
+        Include ALL composer names, work titles, musical forms, genres, and key terms mentioned.
+        Be dense with searchable terms. No filler sentences.
+        
+    Chapter: {chapter_title}
+    
+    Text: {truncated}"""
+        }]
+    )
+
+
+    return response.choices[0].message.content
+
+
+def load_or_generate_summaries(chapter_titles, chapters):
+    """Load from cache or generate from scratch summaries for chapters."""
+    #If the caches document exists
+    if os.path.exists(SUMMARY_CASHE):
+        print(f"Loading cached summaries from {SUMMARY_CASHE}")
+        with open(SUMMARY_CASHE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    #If the cache does not exist, use the LLM to generate summaries chapter by chapter
+    summaries = []
+    total = len(chapters)
+
+    for i, chapter in enumerate(chapters):
+        chapter_text = "".join(chapter)
+        print(f"\r  Creating summary [{i+1}/{total}] {chapter_titles[i]}...", end="", flush=True)
+
+        try:
+            summary = make_chapter_summary(chapter_text, chapter_titles[i])
+        except Exception as e:
+            #If the API summary fails, get the first 1200 words of that chapter instead
+            print(f"\n Chapter{i+1} generation failed: {e}")
+            clean = " ".join(chapter_text.split())
+            summary = clean[:1200]
+
+        summaries.append(summary)
+
+    print(f"\n Generation complete. A total of {total} summaries are generated.")
+
+    #Save the summaries
+    with open(SUMMARY_CASHE, "w", encoding="utf-8") as f:
+        json.dump(summaries, f, ensure_ascii=False, indent=2)
+
+    return summaries
+
 
 
 # ============================================================
-# Step 1: Extract text from PDF
+# Step 1: Extract the contents of the PDF
 # ============================================================
-print(f"Extracting text from {PDF_PATH}...")
-
+print(f"Reading from {PDF_PATH}...")
 doc = fitz.open(PDF_PATH)
-raw_lines = []
-for page in doc:
-    if page.number < 38:  # Skip front matter
-        continue
-    text = page.get_text()
-    raw_lines.extend(text.splitlines(keepends=True))
-
-print(f"  Extracted {len(raw_lines)} lines from {len(doc)} pages")
+#Level1 -> Parts("PART ONE")
+#Level2 -> Chapters("1. Music In Antiquity")
+#Level3 -> subchapters("The Earliest Music")
+toc = doc.get_toc()
 
 # ============================================================
-# Step 2: Clean text
+# Step 2: Get chapter and texts from the table of contents
 # ============================================================
-print("Cleaning text...")
+print("Getting chapter info from table of contents...")
 
-cleaned_lines = []
+#Get the 39 chapters
+chapter_entries = []
 
-for line in raw_lines:
-    # Stop at glossary/appendix
-    if line.strip() == "GLOSSARY":
+for level, title, page in toc:
+    if level == 2 and title[0].isdigit():
+        chapter_entries.append((title, page))
+
+#Generate chapter titles from the toc titles
+# "1. Music In Antiquity" → "Chapter 1: Music In Antiquity"
+CHAPTER_TITLES = []
+for title, page in chapter_entries:
+    dot_pos = title.index(".")
+    num = title[:dot_pos]
+    name = title[dot_pos + 1:].strip()
+    CHAPTER_TITLES.append(f"Chapter {num}: {name}")
+
+# ============================================================
+# Step 3: Extract Text According to the TOC Page Numbers
+# ============================================================
+print("Extracting chapter texts from table of contents...")
+
+#Default a glossary page for fail-safe
+glossary_page = len(doc)
+
+for level, title, page in toc:
+    if "GLOSSARY" in title.upper():
+        glossary_page = page
         break
 
-    # Remove short garbage lines (score artifacts, single characters)
-    if len(line.strip()) < 3:
-        continue
-
-    cleaned_lines.append(line)
-
-print(f"  Cleaned: {len(cleaned_lines)} lines remaining")
-
-# ============================================================
-# Step 3: Split into chapters
-# ============================================================
-print("Splitting into chapters...")
-
 chapters = []
-current_lines = []
-
-for line in cleaned_lines:
-    if line.strip() == "C H A P T E R":
-        if current_lines:
-            chapters.append(current_lines)
-        current_lines = []
+for idx, (title,start_page) in enumerate(chapter_entries):
+    #Set the ending page of the chapter
+    if idx + 1 < len(chapter_entries):
+        end_page = chapter_entries[idx + 1][1]
     else:
-        current_lines.append(line)
+        end_page = glossary_page
 
-# The last chapter
-if current_lines:
-    chapters.append(current_lines)
+    #Get texts page by page
+    # -1 for switching from 1-indexed to 0-indexed
+    chapter_lines = []
+    for page_num in range(start_page-1, end_page-1):
+        page = doc[page_num]
+        text = page.get_text()
+        for line in text.splitlines(keepends=True):
+            if len(line.strip()) >= 3:
+                chapter_lines.append(line)
 
-# Remove pre-chapter content (Part intro, etc.)
-chapters = chapters[1:]
-chapters = chapters[:39]  # Keep only the 39 actual chapters
-print(f"  Found {len(chapters)} chapters")
+    chapters.append(chapter_lines)
+
+print(f"Extracted {len(chapters)} chapters.")
+
+
 
 # ============================================================
-# Step 4: Chunk each chapter into smaller segments with metadata
+# Step 4: Generate summaries and chunking
 # ============================================================
-print("Chunking chapters...")
+print("Generating and chunking...")
 
 splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
 
 all_chunks = []
 all_metadata = []
-
-chapter_summaries = []
 all_summary_metadata = []
 
+#Load or generate summaries for each chapter before chunking
+chapter_summaries = load_or_generate_summaries(CHAPTER_TITLES, chapters)
 
+#Chunking each chapter
 for i, chapter in enumerate(chapters):
     chapter_text = "".join(chapter)
 
-    #Chapter level summary text
-    summary_text = make_chapter_summary(chapter_text)
-    chapter_summaries.append(summary_text)
+    #Metadata of the summaries
     all_summary_metadata.append({
         "chapter_title": CHAPTER_TITLES[i],
         "chapter_num": i + 1,
         "source": SOURCE_LABEL
     })
-
-
-    #Chunks level texts
+    #Chunking
     chunks = splitter.split_text(chapter_text)
 
     for j, chunk in enumerate(chunks):
@@ -162,7 +190,7 @@ for i, chapter in enumerate(chapters):
         })
 
 print(f"  Total chunks: {len(all_chunks)}")
-print(f"  Total chapter summaries: {len(chapter_summaries)}")
+print(f"  Total summaries: {len(chapter_summaries)}")
 
 # ============================================================
 # Step 5: Generate embeddings

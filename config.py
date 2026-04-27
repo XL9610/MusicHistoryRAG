@@ -14,6 +14,8 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 EMBEDDING_DEVICE = "cpu"
 
 # LLM
+SUMMARY_API_KEY = os.getenv("OPENAI_API_KEY")
+SUMMARY_MODEL = "gpt-4o-mini"
 LLM_API_KEY = os.getenv("MINIMAX_API_KEY")
 LLM_BASE_URL = "https://api.minimax.io/anthropic"
 LLM_MODEL = "MiniMax-M2.7"
